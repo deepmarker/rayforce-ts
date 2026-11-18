@@ -14,6 +14,7 @@ export interface ConnectOptions {
   maxPayloadBytes?: number;
   maxBufferedBytes?: number;
   maxPendingRequests?: number;
+  maxPostBytes?: number;
   signal?: AbortSignal;
   /** Async server frames (including multicast) never fulfill a pending request. */
   onPush?: (value: Value) => void | Promise<void>;
@@ -28,6 +29,11 @@ interface Pending {
   signal?: AbortSignal;
   abort?: () => void;
   active: boolean;
+}
+interface Posted {
+  resolve: () => void;
+  reject: (error: Error) => void;
+  bytes: number;
 }
 function errorOf(value: unknown): Error { return value instanceof Error ? value : new Error(String(value)); }
 function positive(n: number, name: string): number {
@@ -46,11 +52,15 @@ export class RayClient {
   private readonly timeout: number;
   private readonly maxPending: number;
   private readonly maxBuffered: number;
+  private readonly maxPostBytes: number;
+  private readonly postQueue: Posted[] = [];
+  private postedBytes = 0;
   private queuedBytes = 0;
   private constructor(private readonly socket: Socket, private readonly options: ConnectOptions) {
     this.maxPayload = checkLimit(options.maxPayloadBytes ?? DEFAULT_MAX_BYTES);
     this.timeout = positive(options.requestTimeoutMs ?? 5000, "requestTimeoutMs");
     this.maxPending = positive(options.maxPendingRequests ?? 64, "maxPendingRequests");
+    this.maxPostBytes = positive(options.maxPostBytes ?? this.maxPayload, "maxPostBytes");
     const buffered = positive(options.maxBufferedBytes ?? this.maxPayload * 2 + 32, "maxBufferedBytes");
     if (buffered < this.maxPayload + 16) throw new RangeError("Receive buffer must fit a complete frame");
     this.maxBuffered = buffered;
@@ -67,6 +77,7 @@ export class RayClient {
     checkLimit(options.maxPayloadBytes ?? DEFAULT_MAX_BYTES);
     positive(options.requestTimeoutMs ?? 5000, "requestTimeoutMs");
     positive(options.maxPendingRequests ?? 64, "maxPendingRequests");
+    positive(options.maxPostBytes ?? (options.maxPayloadBytes ?? DEFAULT_MAX_BYTES), "maxPostBytes");
     const buffered = positive(options.maxBufferedBytes ?? (options.maxPayloadBytes ?? DEFAULT_MAX_BYTES) * 2 + 32, "maxBufferedBytes");
     if (buffered < (options.maxPayloadBytes ?? DEFAULT_MAX_BYTES) + 16) throw new RangeError("Receive buffer must fit a complete frame");
     options.signal?.throwIfAborted();
@@ -132,6 +143,25 @@ export class RayClient {
       this.pump();
     });
   }
+  /** Fire-and-forget async message: resolves once the frame is handed to the socket, rejects if the budget is full. */
+  post(value: Value): Promise<void> {
+    if (this.failure) return Promise.reject(this.failure);
+    if (!this.ready) return Promise.reject(new ConnectionClosedError("Handshake is incomplete"));
+    let frame: Buffer;
+    try {
+      frame = encodeFrame(value, 0, this.maxPayload);
+      if (this.postedBytes + frame.length > this.maxPostBytes) throw new ProtocolError("Async post byte limit exceeded");
+    } catch (e) { return Promise.reject(errorOf(e)); }
+    this.postedBytes += frame.length;
+    return new Promise((resolve, reject) => {
+      const posted: Posted = { resolve, reject, bytes: frame.length };
+      this.postQueue.push(posted);
+      this.socket.write(frame, e => {
+        if (e && !this.failure) this.fail(e);
+        this.settle(posted, e ?? undefined);
+      });
+    });
+  }
   /** Explicitly evaluate source. Use call() and typed values for data arguments. */
   query(source: string, options?: RequestOptions): Promise<Value> {
     return this.request(atom("string", source), options);
@@ -156,6 +186,13 @@ export class RayClient {
     this.active = this.requests[0]!; this.active.active = true;
     this.socket.write(this.active.frame, e => { if (e) this.fail(e); });
   }
+  /** Releases one posted entry; the budget tracks frames the socket has not taken yet. */
+  private settle(posted: Posted, error?: Error): void {
+    const index = this.postQueue.indexOf(posted);
+    if (index < 0) return;
+    this.postQueue.splice(index, 1); this.postedBytes -= posted.bytes;
+    if (error) posted.reject(error); else posted.resolve();
+  }
   private async receive(): Promise<void> {
     while (!this.failure) {
       const header = decodeHeader(await this.reader.read(16), this.maxPayload);
@@ -178,7 +215,8 @@ export class RayClient {
     if (this.failure) return;
     this.failure = reason; this.ready = false; this.reader.fail(reason); this.socket.destroy();
     this.active = undefined; this.queuedBytes = 0;
-    for (const pending of this.requests.splice(0)) { this.clean(pending); pending.reject(reason); }
-    try { this.options.onClose?.(reason); } catch { /* User notifications cannot prevent teardown. */ }
+    for (const posted of this.postQueue.splice(0)) { this.postedBytes -= posted.bytes; posted.reject(reason); }
+    this.postedBytes = 0;
+    for (const pending of this.requests.splice(0)) { this.clean(pending); pending.reject(reason); }    try { this.options.onClose?.(reason); } catch { /* User notifications cannot prevent teardown. */ }
   }
 }

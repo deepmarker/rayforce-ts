@@ -1,6 +1,6 @@
 import { test, expect } from "bun:test";
-import { RayClient, atom, vector, TimeoutError, RayError } from "../src/index.js";
-import { encodeFrame, encodeValue } from "../src/codec.js";
+import { RayClient, atom, vector, TimeoutError, RayError, type Value } from "../src/index.js";
+import { decodeHeader, decodePayload, encodeFrame, encodeValue } from "../src/codec.js";
 import { peer, handshake, readValue, reply } from "./peer.js";
 
 test("fragmented handshake and frames, ordered concurrent requests, interleaved pushes", async () => {
@@ -150,4 +150,85 @@ test("oversized responses and queued request bytes fail within configured bounds
   const client = await RayClient.connect({ port: malicious.port, maxPayloadBytes: 64 });
   try { await expect(client.query("x")).rejects.toThrow("payload size"); expect(client.closed).toBe(true); }
   finally { client.close(); await malicious.close(); }
+});
+
+test("async posts are framed as type 0 and never await a reply", async () => {
+  const seen: Value[] = [];
+  const server = await peer(async (socket, reader) => {
+    await handshake(socket, reader);
+    for (let i = 0; i < 3; i++) {
+      const h = decodeHeader(await reader.read(16));
+      expect(h.type).toBe(0);
+      seen.push(decodePayload(h, await reader.read(h.payloadBytes)));
+    }
+    await readValue(reader);
+    reply(socket, atom("i64", 4n));
+  });
+  const client = await RayClient.connect({ port: server.port });
+  try {
+    await Promise.all([client.post(atom("i64", 1n)), client.post(atom("i64", 2n)), client.post(atom("i64", 3n))]);
+    expect(await client.query("after")).toEqual(atom("i64", 4n));
+    expect(seen).toEqual([atom("i64", 1n), atom("i64", 2n), atom("i64", 3n)]);
+    expect(server.errors).toEqual([]);
+  } finally { client.close(); await server.close(); }
+});
+
+test("posts interleave with an in-flight request without desynchronizing the reply", async () => {
+  const server = await peer(async (socket, reader) => {
+    await handshake(socket, reader);
+    const sync = await readValue(reader);
+    socket.write(encodeFrame(sync, 2));
+    await readValue(reader);
+    await readValue(reader);
+  });
+  const client = await RayClient.connect({ port: server.port });
+  try {
+    const pending = client.query("first");
+    await client.post(atom("string", "a"));
+    await client.post(atom("string", "b"));
+    expect(await pending).toEqual(atom("string", "first"));
+    expect(client.closed).toBe(false);
+  } finally { client.close(); await server.close(); }
+});
+
+test("bounded async post bytes reject without touching a healthy connection", async () => {
+  const server = await peer(async (socket, reader) => {
+    await handshake(socket, reader); await readValue(reader); reply(socket, atom("i64", 1n));
+  });
+  const client = await RayClient.connect({ port: server.port, maxPostBytes: 24 });
+  try {
+    await expect(client.post(atom("string", "x".repeat(64)))).rejects.toThrow("post byte limit");
+    expect(client.closed).toBe(false);
+    expect(await client.query("ok")).toEqual(atom("i64", 1n));
+  } finally { client.close(); await server.close(); }
+});
+
+test("the post budget counts frames the socket has not taken, not just one oversized frame", async () => {
+  const server = await peer(async (socket, reader) => {
+    await handshake(socket, reader);
+    for (;;) { const h = await reader.read(16); await reader.read(Number(h.readBigInt64LE(8))); }
+  });
+  const client = await RayClient.connect({ port: server.port, maxPostBytes: 100_000 });
+  try {
+    const frame = atom("string", "z".repeat(10_000));
+    const results = await Promise.allSettled(Array.from({ length: 100 }, () => client.post(frame)));
+    const rejected = results.filter(r => r.status === "rejected");
+    expect(rejected.length).toBeGreaterThan(0);
+    expect((rejected[0] as PromiseRejectedResult).reason.message).toContain("post byte limit");
+    expect(client.closed).toBe(false);
+  } finally { client.close(); await server.close(); }
+});
+
+test("closing rejects posts still queued for the socket", async () => {
+  const server = await peer(async (socket, reader) => {
+    await handshake(socket, reader);
+    for (;;) { const h = await reader.read(16); await reader.read(Number(h.readBigInt64LE(8))); }
+  });
+  const client = await RayClient.connect({ port: server.port, maxPostBytes: 50_000_000 });
+  const frame = atom("string", "z".repeat(500_000));
+  const results = Array.from({ length: 100 }, () => client.post(frame).then(() => "resolved", () => "rejected"));
+  await new Promise(resolve => setTimeout(resolve, 0));
+  client.close();
+  expect((await Promise.all(results)).filter(r => r === "rejected").length).toBeGreaterThan(0);
+  await server.close();
 });

@@ -24,6 +24,44 @@ const arrays: Partial<Record<ScalarType, new (buffer: ArrayBuffer) => Cells>> = 
 };
 const utf8 = new TextDecoder("utf-8", { fatal: true });
 const littleEndian = new Uint8Array(new Uint16Array([1]).buffer)[0] === 1;
+const symbols = new Map<string, string>();
+
+/** Shares decoded instances so repeated symbols do not each allocate a new string. */
+function internSymbol(value: string): string {
+  const known = symbols.get(value);
+  if (known !== undefined) return known;
+  if (symbols.size >= 4096) symbols.clear();
+  symbols.set(value, value);
+  return value;
+}
+
+
+
+/** Splits one decoded UTF-8 buffer by byte lengths; ASCII needs no offset map. */
+function splitUtf8(text: string, data: Uint8Array, sizes: number[]): string[] {
+  const out = new Array<string>(sizes.length);
+  let ascii = true;
+  for (let i = 0; i < data.length; i++) if (data[i]! >= 0x80) { ascii = false; break; }
+  if (ascii) {
+    let at = 0;
+    for (let i = 0; i < sizes.length; i++) { const next = at + sizes[i]!; out[i] = text.substring(at, next); at = next; }
+    return out;
+  }
+  const map = new Uint32Array(data.length + 1);
+  let chars = 0;
+  for (let i = 0; i < data.length; i++) {
+    map[i] = chars;
+    if ((data[i]! & 0xc0) !== 0x80) chars++;
+  }
+  map[data.length] = chars;
+  let at = 0;
+  for (let i = 0; i < sizes.length; i++) {
+    const next = at + sizes[i]!;
+    out[i] = text.substring(map[at]!, map[next]!);
+    at = next;
+  }
+  return out;
+}
 
 function fail(message: string): never { throw new ProtocolError(message); }
 function byte(n: number): number {
@@ -77,19 +115,47 @@ function scalar(a: Atom): Buffer {
 function vectorBody(v: Vector): Buffer {
   if (v.type === "symbol" || v.type === "string") {
     if (!Array.isArray(v.values) || v.values.some(x => typeof x !== "string")) fail("Text vector requires strings");
-    return Buffer.concat((v.values as string[]).map(s => {
-      if (v.type === "symbol") return cstring(s);
-      const b = Buffer.from(s, "utf8"); return Buffer.concat([count(b.length), b]);
-    }));
+    const texts = v.values as string[];
+    if (v.type === "symbol") return cstrings(texts);
+    let total = 0;
+    for (const s of texts) total += 8 + Buffer.byteLength(s, "utf8");
+    const out = Buffer.allocUnsafe(total);
+    let o = 0;
+    for (const s of texts) {
+      const n = out.write(s, o + 8, "utf8");
+      out.writeBigInt64LE(BigInt(n), o);
+      o += 8 + n;
+    }
+    return out;
   }
   if (v.type === "guid") {
     if (!Array.isArray(v.values) || v.values.some(x => !(x instanceof Uint8Array) || x.length !== 16)) fail("GUID vector requires 16-byte values");
-    return Buffer.concat((v.values as Uint8Array[]).map(x => Buffer.from(x)));
+    const guids = v.values as Uint8Array[];
+    const out = Buffer.allocUnsafe(guids.length * 16);
+    for (let i = 0; i < guids.length; i++) out.set(guids[i]!, i * 16);
+    return out;
   }
   const ctor = arrays[v.type];
   if (!ctor || !(v.values instanceof ctor) || !littleEndian) fail("Vector has the wrong typed array or unsupported host byte order");
   const data = v.values as Exclude<Cells, string[] | Uint8Array[]>;
   return Buffer.from(data.buffer, data.byteOffset, data.byteLength);
+}
+
+/** Interned symbols are usually a small repeated set; cache their encoded bytes instead of rebuilding them. */
+function cstrings(texts: string[]): Buffer {
+  let length = 0;
+  for (const s of texts) { if (s.includes("\0")) fail("Symbols and function names cannot contain NUL"); length += Buffer.byteLength(s, "utf8") + 1; }
+  const out = Buffer.allocUnsafe(length);
+  const known = new Map<string, Buffer>();
+  let o = 0;
+  for (const s of texts) {
+    let b = known.get(s);
+    if (b) { out.set(b, o); o += b.length; continue; }
+    b = Buffer.from(s + "\0", "utf8");
+    if (known.size < 256) known.set(s, b);
+    out.set(b, o); o += b.length;
+  }
+  return out;
 }
 
 export function encodeValue(value: Value, maxBytes = DEFAULT_MAX_BYTES): Buffer {
@@ -159,6 +225,64 @@ class Cursor {
     if (end < 0) fail("Unterminated symbol or function name");
     const b = this.take(end - this.offset); this.take(1); return this.text(b);
   }
+  /** Validates the whole run once, then splits it; per-element decode calls dominate otherwise. */
+  cstrings(n: number): string[] {
+    if (n === 0) return [];
+    const start = this.offset;
+    let end = start;
+    for (let i = 0; i < n; i++) {
+      const nul = this.bytes.indexOf(0, end);
+      if (nul < 0) fail("Unterminated symbol");
+      end = nul + 1;
+    }
+    const run = this.bytes.subarray(start, end);
+    this.offset = end;
+    let text: string;
+    // One validation pass over the whole run avoids per-element decodes; substring beats split here.
+    try { text = utf8.decode(run); } catch { return fail("Invalid UTF-8 text"); }
+    const strings: string[] = new Array(n);
+    let from = 0;
+    // Interning only pays off on small vectors; the map lookup costs more than it saves on large ones.
+    const intern = n <= 64;
+    for (let i = 0; i < n; i++) {
+      const to = text.indexOf("\0", from);
+      if (to < 0) return fail("Symbol count mismatch");
+      const value = text.substring(from, to);
+      strings[i] = intern ? internSymbol(value) : value;
+      from = to + 1;
+    }
+    return strings;
+  }
+  /** Length-prefixed strings: one decode plus index extraction beats a decode per element. */
+  strings(n: number): string[] {
+    if (n === 0) return [];
+    const start = this.offset;
+    const sizes = new Array<number>(n);
+    let cursor = start;
+    for (let i = 0; i < n; i++) {
+      if (this.bytes.length - cursor < 8) fail("Truncated string vector");
+      const size = this.bytes.readBigInt64LE(cursor);
+      if (size < 0n || size > BigInt(this.bytes.length - cursor - 8)) fail("Invalid string length");
+      sizes[i] = Number(size);
+      cursor += 8 + Number(size);
+    }
+    const run = this.bytes.subarray(start, cursor);
+    this.offset = cursor;
+    let size = 0;
+    for (let i = 0; i < n; i++) size += sizes[i]!;
+    const data = new Uint8Array(size);
+    let at = 0;
+    let byte = 0;
+    for (let i = 0; i < n; i++) {
+      const length = sizes[i]!;
+      data.set(run.subarray(byte + 8, byte + 8 + length), at);
+      at += length;
+      byte += 8 + length;
+    }
+    let text: string;
+    try { text = utf8.decode(data); } catch { return fail("Invalid UTF-8 text"); }
+    return splitUtf8(text, data, sizes);
+  }
   value(depth = 0): Value {
     if (depth > 128) fail("Value nesting exceeds 128 levels");
     const raw = this.u8(); const tag = raw > 127 ? raw - 256 : raw;
@@ -220,13 +344,14 @@ class Cursor {
     }
     const n = this.len(widths[type] ?? 1);
     let values: Cells;
-    if (type === "symbol" || type === "string") {
-      const strings: string[] = [];
-      for (let i = 0; i < n; i++) strings.push(type === "symbol" ? this.cstring() : this.text(this.take(this.len())));
-      values = strings;
+    if (type === "symbol") {
+      values = this.cstrings(n);
+    } else if (type === "string") {
+      values = this.strings(n);
     } else if (type === "guid") {
-      const guids: Uint8Array[] = [];
-      for (let i = 0; i < n; i++) guids.push(Uint8Array.from(this.take(16)));
+      const bytes = this.take(n * 16);
+      const guids = new Array<Uint8Array>(n);
+      for (let i = 0; i < n; i++) { const guid = new Uint8Array(16); guid.set(bytes.subarray(i * 16, i * 16 + 16)); guids[i] = guid; }
       values = guids;
     } else {
       if (!littleEndian) fail("Unsupported host byte order");

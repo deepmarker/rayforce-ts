@@ -57,6 +57,14 @@ describe.skipIf(!enabled)("native Rayforce integration", () => {
     await expect(client.query('(+ 1 "text")')).rejects.toBeInstanceOf(RayError);
     expect(await client.query("(+ 1 2)")).toMatchObject({ type: "i64", value: 3n });
   });
+  test("async posts are evaluated without a reply and keep the connection usable", async () => {
+    await client.query("(set posted 0)");
+    await Promise.all(Array.from({ length: 100 }, () => client.post(atom("string", "(set posted 1)"))));
+    expect(await client.query("posted")).toMatchObject({ type: "i64", value: 1n });
+    expect(await client.query("(+ 1 1)")).toMatchObject({ type: "i64", value: 2n });
+    await client.post(atom("string", '(+ 1 "bad")'));
+    expect(await client.query("(+ 2 2)")).toMatchObject({ type: "i64", value: 4n });
+  });
   test("native multicast pushes are received separately from responses", async () => {
     await client.call(".mc.sub", [atom("string", "ipc-test"), { kind: "null" }]);
     await client.call(".mc.pub", [symbol("ipc-test"), atom("i64", 123n)]);

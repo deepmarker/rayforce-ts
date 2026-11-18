@@ -73,6 +73,16 @@ used. `request(value)` is the low-level synchronous IPC message operation
 (the JavaScript API is asynchronous). It sends the exact typed expression
 you provide, so it is also suitable for application-specific IPC dispatchers.
 
+`post(value)` sends an asynchronous IPC message: the server evaluates it and
+sends no reply, so it never waits for a round trip. This is the right
+primitive for high-rate ingestion. The promise resolves once the frame is
+handed to the socket and rejects if the connection fails first.
+
+```ts
+await client.post(atom("string", '(set counter 1)'));
+// no reply is awaited; a later request observes the effect
+```
+
 Supply `user` and `password` in `connect` when the server requires them.
 The wire v3 credential handshake is supported, including UTF-8 byte limits.
 The transport is plain TCP. TLS, Unix-domain sockets, shared memory and RDMA
@@ -173,6 +183,7 @@ Defaults:
 | `maxPayloadBytes` | 64 MiB | Maximum encoded or decompressed message body |
 | `maxBufferedBytes` | Twice the payload limit plus 32 bytes | Receive backlog and queued request bytes, each bounded independently |
 | `maxPendingRequests` | 64 | Active plus queued requests |
+| `maxPostBytes` | The payload limit | Async post bytes the socket has not accepted yet |
 | `connectTimeoutMs` | 5000 | TCP connection plus credential handshake |
 | `requestTimeoutMs` | 5000 | Per-request deadline from enqueue |
 
