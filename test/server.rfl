@@ -1,0 +1,7 @@
+(set BIN 123)
+(set echo (fn [x] x))
+(set sample
+  (table [venue instrument ts price quantity]
+    (list ['BIN 'BFU] ['BTCUSDT 'BTCUSDT]
+          [2026.11.18D10:00:00.123456789 2026.11.18D10:00:00.987654321]
+          [100000000001 200000000002] [0Nl 9007199254740993])))

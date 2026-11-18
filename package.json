@@ -1,0 +1,41 @@
+{
+  "name": "@deepmarker/rayforce-ts",
+  "version": "0.1.0",
+  "description": "Typed asynchronous TCP IPC client for RayforceDB",
+  "type": "module",
+  "license": "MIT",
+  "engines": {
+    "node": ">=20"
+  },
+  "exports": {
+    ".": {
+      "types": "./dist/index.d.ts",
+      "import": "./dist/index.js"
+    },
+    "./codec": {
+      "types": "./dist/codec.d.ts",
+      "import": "./dist/codec.js"
+    }
+  },
+  "files": [
+    "dist",
+    "src",
+    "README.md"
+  ],
+  "scripts": {
+    "build": "tsc -p tsconfig.json",
+    "test": "bun test",
+    "check": "bun run build && bun test",
+    "test:integration": "RAYFORCE=rayforce bun test test/integration.test.ts",
+    "test:node": "bun run build && node scripts/smoke-node.mjs",
+    "prepack": "npm run build"
+  },
+  "devDependencies": {
+    "@types/node": "^22.0.0",
+    "typescript": "^5.9.3"
+  },
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/deepmarker/rayforce-ts.git"
+  }
+}
